@@ -21,6 +21,12 @@ export {
 	PidMinLaunchConfig,
 } from './pid_min_launch_control';
 import { clampf, pt1Alpha } from './utils';
+import {
+	PidMinDmaxConfig,
+	PidMinDmaxState,
+	computeDmaxMultiplier,
+	makeDefaultDmaxState,
+} from './pid_min_dmax';
 
 // Coefficients (gains)
 export interface PidMinCoefficients {
@@ -39,6 +45,8 @@ export interface PidMinConfig {
 	dLowpassCutoffHz: number; // PT1 cutoff for gyro used by D-term; 0 disables
 	// I-term relax (minimal)
 	iRelax: PidMinItermRelaxConfig; // nested configuration for I-term relax
+	// D-Max boost (optional)
+	dMax?: PidMinDmaxConfig | null;
 }
 
 // Per-axis state
@@ -48,6 +56,7 @@ export class PidMinState {
 	prevSetpoint = 0; // last setpoint (for feedforward)
 	prevSetpointLpf = 0; // last lowpassed setpoint (for I-term relax)
 	initialized = false; // guard first update
+	dmax: PidMinDmaxState = makeDefaultDmaxState(); // D-Max per-axis state
 }
 
 // Init/reset
@@ -57,6 +66,7 @@ export function pidMinInit(s: PidMinState): void {
 	s.prevSetpoint = 0;
 	s.prevSetpointLpf = 0;
 	s.initialized = false;
+	s.dmax = makeDefaultDmaxState();
 }
 
 export function pidMinReset(s: PidMinState): void {
@@ -100,6 +110,9 @@ export function pidMinUpdateUnified(
 	const setpointPrev = initialized ? prev.prevSetpoint : setpoint;
 	const setpointLpfPrev = initialized ? prev.prevSetpointLpf : setpoint;
 	let integrator = initialized ? prev.integrator : 0;
+	const dmaxPrev: PidMinDmaxState = initialized
+		? prev.dmax
+		: makeDefaultDmaxState();
 
 	const launchEffects: PidMinLaunchEffects = computeLaunchEffects(
 		axis,
@@ -165,9 +178,25 @@ export function pidMinUpdateUnified(
 		cfg.dLowpassCutoffHz > 0 ? pt1Alpha(cfg.dLowpassCutoffHz, dt) : 1;
 	const gyroFiltered = gyroFilteredPrev + alpha * (gyro - gyroFilteredPrev);
 	const dGyro = gyroFiltered - gyroFilteredPrev;
+	// D-Max multiplier and state update (always update filter states)
+	const deltaGyroDt = -dGyro / dt;
+	const setpointDelta = setpoint - setpointPrev;
+	let dMultiplier = 1.0;
+	let dmaxNext: PidMinDmaxState = dmaxPrev;
+	if (cfg.dMax && cfg.dMax.enabled) {
+		const dmaxRes = computeDmaxMultiplier(cfg.dMax, dmaxPrev, {
+			axis,
+			deltaGyroDt,
+			setpointDelta,
+			dt,
+		});
+		dMultiplier = dmaxRes.multiplier;
+		dmaxNext = dmaxRes.state;
+	}
+
 	let D = 0;
 	if (!launchEffects.disableD) {
-		D = c.Kd * (-dGyro / dt);
+		D = c.Kd * deltaGyroDt * dMultiplier;
 	}
 
 	// Feedforward disabled under launch
@@ -196,6 +225,7 @@ export function pidMinUpdateUnified(
 	next.prevSetpoint = setpoint;
 	next.prevSetpointLpf = setpointLpfNext;
 	next.initialized = true;
+	next.dmax = dmaxNext;
 
 	return { output: sum, state: next };
 }
@@ -216,6 +246,14 @@ export function pidMinUpdateUnified(
 //     iRelaxCutoffHz: 15,               // typical default
 //     iRelaxSetpointThreshold: 40,      // typical default
 //     iRelaxType: PidMinItermRelaxType.Setpoint // or Gyro, or Off
+//   }
+//   // D-Max (optional)
+//   dMax: {
+//     enabled: true,
+//     dMaxPercent: { roll: 1.25, pitch: 1.25, yaw: 1.10 },
+//     gain: 37,
+//     advance: 20,
+//     // rangeCutoffHz: 85, lowpassCutoffHz: 35, // defaults
 //   }
 // };
 // const lc: PidMinLaunchConfig = { enabled: true, mode: PidMinLaunchMode.PitchOnly, angleLimitDeg: 30, kiOverride: 0.15 };
