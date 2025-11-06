@@ -18,36 +18,73 @@
  * If not, see <http://www.gnu.org/licenses/>.
  */
 
+// Standard C headers
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
 
+// Diagnostics-friendly shims: benign fallbacks when full include paths are missing
+#include "flight/pid_shims.h"
+
+// Platform and optional subsystem headers, guarded to avoid editor file-not-found diagnostics
+#if defined(__has_include) && __has_include("platform.h")
 #include "platform.h"
+#endif
 
+#if defined(__has_include) && __has_include("build/build_config.h")
 #include "build/build_config.h"
+#endif
+#if defined(__has_include) && __has_include("build/debug.h")
 #include "build/debug.h"
+#endif
 
+#if defined(__has_include) && __has_include("common/axis.h")
 #include "common/axis.h"
+#endif
+#if defined(__has_include) && __has_include("common/filter.h")
 #include "common/filter.h"
+#endif
 
+#if defined(__has_include) && __has_include("drivers/dshot_command.h")
 #include "drivers/dshot_command.h"
+#endif
 
+#if defined(__has_include) && __has_include("fc/rc_controls.h")
 #include "fc/rc_controls.h"
+#endif
+#if defined(__has_include) && __has_include("fc/runtime_config.h")
 #include "fc/runtime_config.h"
+#endif
+#if defined(__has_include) && __has_include("fc/rc.h")
 #include "fc/rc.h"
+#endif
 
+#if defined(__has_include) && __has_include("flight/pid.h")
 #include "flight/pid.h"
+#endif
+#if defined(__has_include) && __has_include("flight/rpm_filter.h")
 #include "flight/rpm_filter.h"
+#endif
 
+#if defined(__has_include) && __has_include("pg/motor.h")
 #include "pg/motor.h"
+#endif
 
+#if defined(__has_include) && __has_include("rx/rx.h")
 #include "rx/rx.h"
+#endif
 
+#if defined(__has_include) && __has_include("sensors/gyro.h")
 #include "sensors/gyro.h"
+#endif
+#if defined(__has_include) && __has_include("sensors/sensors.h")
 #include "sensors/sensors.h"
+#endif
 
+#if defined(__has_include) && __has_include("pid_init.h")
 #include "pid_init.h"
+#endif
 
 #ifdef USE_D_MAX
 #define D_MAX_RANGE_HZ 85    // PT2 lowpass input cutoff to peak D around propwash frequencies
@@ -128,6 +165,18 @@ static void tpaSpeedInit(const pidProfile_t *pidProfile)
 }
 #endif // USE_WING
 
+/* Study Guide: Initializes runtime filters and helpers used by the PID loop.
+ * Overview:
+ * - D-term notch: optional notch filter around propwash/gyro resonance.
+ * - D-term lowpass1/2: main and secondary smoothing of derivative noise; can be dynamic.
+ * - Yaw P-term lowpass: reduces yaw instability on noisy setups.
+ * - I-term relax (windupLpf): predicts vehicle response to setpoint, used to suppress integral during transients.
+ * - Absolute Control LPF: path estimation filter used to correct setpoint tracking error.
+ * - D-Max filters: pre-conditions activity signals to schedule higher D near propwash.
+ * - Airmode LPF: transient throttle offset filtering to avoid mirroring noise.
+ * - ACC attitude filters: smoothing for angle/horizon setpoint and estimation.
+ * Each filter is only initialized when enabled and within Nyquist limits.
+ */
 void pidInitFilters(const pidProfile_t *pidProfile)
 {
     STATIC_ASSERT(FD_YAW == 2, FD_YAW_incorrect); // ensure yaw axis is 2
@@ -376,6 +425,12 @@ static void tpaCurveInit(const pidProfile_t *pidProfile)
 }
 #endif // USE_ADVANCED_TPA
 
+/* Study Guide: Entry point to initialize PID subsystem.
+ * - Sets target looptime from gyro.
+ * - Builds filter instances (pidInitFilters).
+ * - Maps configuration to runtime fields (pidInitConfig).
+ * - Initializes RPM filter and advanced TPA when available.
+ */
 void pidInit(const pidProfile_t *pidProfile)
 {
     pidSetTargetLooptime(gyro.targetLooptime); // Initialize pid looptime
@@ -389,6 +444,14 @@ void pidInit(const pidProfile_t *pidProfile)
 #endif
 }
 
+/* Study Guide: Maps tune-time `pidProfile` into `pidRuntime`.
+ * - Scales P/I/D/F into floating `pidCoefficient[*]` via fixed constants.
+ * - Applies extras: integrated yaw I scaling, angle/horizon gains, limits, and delays.
+ * - Configures dynamic LPF, launch control, thrust linearization, D-Max scheduling.
+ * - Normalizes feedforward smoothing to a 250 Hz RC packet rate and sets boost/yaw-hold.
+ * - Computes TPA breakpoints/multipliers used to attenuate P/D at high throttle.
+ * Many of these are consumed by pid.c each loop to compute P/I/D/F/S.
+ */
 void pidInitConfig(const pidProfile_t *pidProfile)
 {
     for (int axis = FD_ROLL; axis <= FD_YAW; axis++) {
@@ -401,6 +464,8 @@ void pidInitConfig(const pidProfile_t *pidProfile)
     if (!pidProfile->use_integrated_yaw)
 #endif
     {
+        // When using classic yaw (no integrated yaw), compensate for model mismatch:
+        // increase Ki ~2.5x to achieve comparable yaw integral authority.
         pidRuntime.pidCoefficient[FD_YAW].Ki *= 2.5f;
     }
     pidRuntime.angleGain = pidProfile->pid[PID_LEVEL].P / 10.0f;
@@ -545,34 +610,44 @@ void pidInitConfig(const pidProfile_t *pidProfile)
     pidRuntime.airmodeThrottleOffsetLimit = pidProfile->transient_throttle_limit / 100.0f;
 #endif
 
-#ifdef USE_FEEDFORWARD
+ #ifdef USE_FEEDFORWARD
+    // Feedforward normalization and parameters:
+    // - `feedforward_transition`: center-stick attenuation factor [0..1].
+    // - Smoothing normalization: scale to 250 Hz RC packet rate so behavior is radio-rate invariant.
+    //   Using first-order low-pass tau: tau = (rxDt * s) / (1 - s), where s = 0.01 * smooth_factor.
+    // - `jitter_factor`: attenuate FF when consecutive RC steps are small (center stick).
+    // - `boost_factor`: small acceleration term added to FF to preempt motor lag.
+    // - `yaw_hold`: high-pass sustained yaw component with time constant; gain normalized for short taus.
     pidRuntime.feedforwardTransition = pidProfile->feedforward_transition / 100.0f;
     pidRuntime.feedforwardTransitionInv = (pidProfile->feedforward_transition == 0) ? 0.0f : 100.0f / pidProfile->feedforward_transition;
     pidRuntime.feedforwardAveraging = pidProfile->feedforward_averaging;
     // feedforward_smooth_factor effect previously would change based on packet looprate
     // normalizing to 250hz packet rate as that is the most commonly used ELRS packet rate
-    float scaledSmoothFactor = 0.01f * pidProfile->feedforward_smooth_factor;
-    float rxDt = 1.0f / 250.0f;
-    float feedforwardSmoothingTau = (rxDt * scaledSmoothFactor) / (1.0f - scaledSmoothFactor);
+    float scaledSmoothFactor = 0.01f * pidProfile->feedforward_smooth_factor; // convert percent to [0..1]
+    float rxDt = 1.0f / 250.0f; // reference RC rate (seconds per packet)
+    float feedforwardSmoothingTau = (rxDt * scaledSmoothFactor) / (1.0f - scaledSmoothFactor); // first-order LPF tau
     pidRuntime.feedforwardSmoothFactor = feedforwardSmoothingTau;
     pidRuntime.feedforwardJitterFactor = pidProfile->feedforward_jitter_factor;
     pidRuntime.feedforwardJitterFactorInv = 1.0f / (1.0f + pidProfile->feedforward_jitter_factor);
     pidRuntime.feedforwardBoostFactor = 0.001f * pidProfile->feedforward_boost;
     pidRuntime.feedforwardMaxRateLimit = pidProfile->feedforward_max_rate_limit;
     pidRuntime.feedforwardInterpolate = !(rxRuntimeState.serialrxProvider == SERIALRX_CRSF);
-    pidRuntime.feedforwardYawHoldTime = 0.001f * pidProfile->feedforward_yaw_hold_time; // input time constant in milliseconds, converted to seconds
+    pidRuntime.feedforwardYawHoldTime = 0.001f * pidProfile->feedforward_yaw_hold_time; // ms -> s time constant
     pidRuntime.feedforwardYawHoldGain = pidProfile->feedforward_yaw_hold_gain;
-    // normalise/maintain boost when time constant is small, 1.5x at 50ms, 2x at 25ms, almost 3x at 10ms
+    // Normalize/maintain boost when time constant is small:
+    // ~1.5x at 50ms, ~2x at 25ms, ~3x at 10ms to preserve perceived response.
     if (pidProfile->feedforward_yaw_hold_time < 100) {
         pidRuntime.feedforwardYawHoldGain *= 150.0f / (float)(pidProfile->feedforward_yaw_hold_time + 50);
     }
 #endif
 
     pidRuntime.levelRaceMode = pidProfile->level_race_mode;
+    // TPA mapping: convert PWM breakpoints into [0..1] normalized throttle domain
     pidRuntime.tpaBreakpoint = constrainf((pidProfile->tpa_breakpoint - PWM_RANGE_MIN) / 1000.0f, 0.0f, 0.99f);
     // default of 1350 returns 0.35. range limited to 0 to 0.99
     pidRuntime.tpaMultiplier = (pidProfile->tpa_rate / 100.0f) / (1.0f - pidRuntime.tpaBreakpoint);
     // it is assumed that tpaLowBreakpoint is always less than or equal to tpaBreakpoint
+    // Low TPA limits attenuation at low throttle; constrained to be <= high breakpoint
     pidRuntime.tpaLowBreakpoint = constrainf((pidProfile->tpa_low_breakpoint - PWM_RANGE_MIN) / 1000.0f, 0.01f, 1.0f);
     pidRuntime.tpaLowBreakpoint = MIN(pidRuntime.tpaLowBreakpoint, pidRuntime.tpaBreakpoint);
     pidRuntime.tpaLowMultiplier = pidProfile->tpa_low_rate / (100.0f * pidRuntime.tpaLowBreakpoint);

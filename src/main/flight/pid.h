@@ -21,14 +21,75 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
+// Lightweight, guarded fallbacks to ease editor diagnostics when full
+// Betaflight headers are not on the include path. These shims only apply
+// when the corresponding headers are missing and do not affect real builds.
+#ifndef __has_include
+#define __has_include(x) 0
+#endif
+
+// Axis definitions (FD_ROLL/FD_PITCH/FD_YAW) and counts
+#if __has_include("common/axis.h")
 #include "common/axis.h"
-#include "common/chirp.h"
-#include "common/filter.h"
-#include "common/pwl.h"
-#include "common/time.h"
+#else
+#ifndef XYZ_AXIS_COUNT
+#define XYZ_AXIS_COUNT 3
+#endif
+#ifndef RP_AXIS_COUNT
+#define RP_AXIS_COUNT 2
+#endif
+#ifndef FD_ROLL
+#define FD_ROLL 0
+#define FD_PITCH 1
+#define FD_YAW 2
+#endif
+typedef enum { AI_ROLL, AI_PITCH } angle_index_t;
+#endif
 
+// Chirp/phase compensation structs used by optional CHIRP feature
+#if __has_include("common/chirp.h")
+#include "common/chirp.h"
+#else
+typedef struct { int _unused; } chirp_t;
+typedef struct { int _unused; } phaseComp_t;
+#endif
+
+// Filter types and apply function pointer
+#if __has_include("common/filter.h")
+#include "common/filter.h"
+#else
+typedef struct { float _s; } pt1Filter_t;
+typedef struct { float _bq[5]; } biquadFilter_t;
+typedef struct { float _p2[5]; } pt2Filter_t;
+typedef struct { float _p3[5]; } pt3Filter_t;
+typedef float (*filterApplyFnPtr)(void *filter, float sample);
+static inline float nullFilterApply(void *filter, float sample) { (void)filter; return sample; }
+#endif
+
+// Piecewise-linear helper used by advanced TPA
+#if __has_include("common/pwl.h")
+#include "common/pwl.h"
+#else
+typedef struct { float *x; float *y; int n; } pwl_t;
+#endif
+
+// Time typedefs
+#if __has_include("common/time.h")
+#include "common/time.h"
+#else
+typedef uint32_t timeUs_t;
+typedef uint32_t timeDelta_t;
+#endif
+
+// Parameter group macros (declare-only fallbacks)
+#if __has_include("pg/pg.h")
 #include "pg/pg.h"
+#else
+#define PG_DECLARE_ARRAY(type, count, name) extern type name[];
+#define PG_DECLARE(type, name) extern type name;
+#endif
 
 #define MAX_PID_PROCESS_DENOM       16
 #define PID_CONTROLLER_BETAFLIGHT   1
@@ -142,6 +203,13 @@ typedef enum {
     PID_CRASH_RECOVERY_DISARM,
 } pidCrashRecovery_e;
 
+/* Study Guide: PID gains configuration (pidf_t)
+ * Stores profile gains per axis as percentages/integers coming from user configuration.
+ * Units:
+ * - P,I,D are 0–PID_GAIN_MAX; F is 0–F_GAIN_MAX and later scaled by FEEDFORWARD_SCALE.
+ * - S is additional wing term (USE_WING).
+ * These are mapped to runtime floating coefficients in pid_init.c (pidRuntime.pidCoefficient[*]).
+ */
 typedef struct pidf_s {
     uint8_t P;
     uint8_t I;
@@ -188,7 +256,22 @@ typedef enum {
 } yawType_e;
 
 #define MAX_PROFILE_NAME_LENGTH 8u
-
+/* Study Guide: pidProfile_t (tune-time configuration)
+ * The master configuration for the PID controller and related features.
+ * Groupings:
+ * - Filtering: `yaw_lowpass_hz`, `dterm_lpf1_*`, `dterm_lpf2_*`, `dterm_notch_*`, dynamic LPF fields.
+ * - Gains: `pid[PID_*]` holds P/I/D/F/S for Roll, Pitch, Yaw, Level (Angle/Horizon).
+ * - Limits/behavior: `pidSumLimit*`, `itermWindup`, `pidAtMinThrottle`, `angle_limit`.
+ * - Crash Recovery: thresholds and timers to detect and recover.
+ * - I-term features: rotation, relax type/cutoff/enable.
+ * - Absolute Control: `abs_control_*` tunes setpoint trajectory correction.
+ * - Anti Gravity/Accelerator: `anti_gravity_gain`.
+ * - TPA/SPA: attenuation curves vs throttle and setpoint; advanced wing-specific curves and speed model.
+ * - Feedforward: transition, averaging/smoothing/jitter, boost, yaw hold.
+ * - Launch control, integrated yaw, thrust linearization, transient throttle limit.
+ * - Misc: dynamic idle, profile name, auto profile cell count, landing/ez landing helpers.
+ * pid_init.c maps these to `pidRuntime` and filter instances; pid.c consumes them per loop.
+ */
 typedef struct pidProfile_s {
     uint16_t yaw_lowpass_hz;                // Additional yaw filter when yaw axis too noisy
     uint16_t dterm_lpf1_static_hz;          // Static Dterm lowpass 1 filter cutoff value in hz
@@ -347,6 +430,12 @@ PG_DECLARE(pidConfig_t, pidConfig);
 
 union rollAndPitchTrims_u;
 void pidController(const pidProfile_t *pidProfile, timeUs_t currentTimeUs);
+/* Study Guide: Per-axis PID term container
+ * pidAxisData_t holds computed term contributions for a single axis during one PID loop:
+ * - P,I,D,F are the classic terms; S is wing-specific extra term when USE_WING.
+ * - Sum is the accumulated pidsum used for motor/servo mixing after clamps.
+ * This is not configuration; values are generated inside pid.c each iteration.
+ */
 
 typedef struct pidAxisData_s {
     float P;
@@ -365,6 +454,12 @@ typedef union dtermLowpass_u {
     pt3Filter_t pt3Filter;
 } dtermLowpass_t;
 
+/* Study Guide: pidCoefficient_t (runtime-scaled gains)
+ * Floating-point Kp/Ki/Kd/Kf derived from `pidProfile->pid[*]` via fixed scales:
+ * - Kp = `PTERM_SCALE * P`, Ki = `ITERM_SCALE * I`, Kd = `DTERM_SCALE * D`.
+ * - Kf = `FEEDFORWARD_SCALE * (F * 0.01f)` to convert percent F to coefficient.
+ * May be adjusted further in pid_init.c for integrated yaw and Absolute Control.
+ */
 typedef struct pidCoefficient_s {
     float Kp;
     float Ki;
@@ -382,6 +477,29 @@ typedef struct tpaSpeedParams_s {
     float pitchOffset;
 } tpaSpeedParams_t;
 
+/* Study Guide: pidRuntime_t (derived state, filters, and feature toggles)
+ * Populated at startup by pid_init.c and updated per-loop by pid.c.
+ * Key groups:
+ * - Timebase: `dT`, `pidFrequency`, previous setpoints.
+ * - D-term filters: notch, lowpass1/2; pointers select type per axis.
+ * - Anti-gravity: LPF, gains, accelerator constants.
+ * - Coefficients: `pidCoefficient[axis]` holding Kp/Ki/Kd/Kf after scaling.
+ * - Angle/Horizon: gains, limits, OSD cutoff, smoothing/filters and delay.
+ * - Crash Recovery: thresholds, timers, active state and limits.
+ * - I-term: limits, rotation, reset rules, relax filters and type.
+ * - Throttle PID Attenuation (TPA): breakpoints, multipliers, low TPA settings.
+ * - Airmode LPF/offset limit: transient throttle offset filtering and bounds.
+ * - Absolute Control: cutoff, gain, limits, per-axis filter and correction cache.
+ * - D-Max: range/lowpass filters, percent boosts, gyro/setpoint gain scheduling.
+ * - Dynamic LPF: filter kind and min/max/expo for dynamic dterm cutoff.
+ * - Launch Control: angle limit and K_i override while active.
+ * - Integrated Yaw Control: enabled flag and relax setting.
+ * - Thrust Linearization: linearization factor and compensation.
+ * - Feedforward: averaging, smoothing tau, jitter/boost/transition, yaw-hold params, interpolation.
+ * - ACC-derived attitude estimation: filters and angle targets for angle/horizon modes.
+ * - Wings/advanced TPA/CHIRP: SPA arrays, speed params, precomputed PWL curve, chirp excitation state.
+ * Consumers in pid.c read these to compute per-axis P/I/D/F/S and apply modifiers safely.
+ */
 typedef struct pidRuntime_s {
     float dT;
     float pidFrequency;

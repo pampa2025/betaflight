@@ -24,13 +24,51 @@
 #include <string.h>
 #include <math.h>
 
-#include "platform.h"
+// Diagnostics-friendly shims: benign fallbacks when full include paths are missing
+#include "pid_shims.h"
 
+#if defined(__has_include)
+#  if __has_include("platform.h")
+#    include "platform.h"
+#  elif __has_include("../../platform/APM32/include/platform/platform.h")
+#    include "../../platform/APM32/include/platform/platform.h"
+#  else
+// Fallbacks for editors/lint when platform headers are not on the include path.
+// These macros expand to nothing so code remains valid without platform-specific sections.
+#    ifndef FAST_DATA_ZERO_INIT
+#      define FAST_DATA_ZERO_INIT
+#    endif
+#    ifndef FAST_DATA
+#      define FAST_DATA
+#    endif
+#    ifndef FAST_CODE
+#      define FAST_CODE
+#    endif
+#    ifndef FAST_CODE_NOINLINE
+#      if defined(__GNUC__)
+#        define FAST_CODE_NOINLINE __attribute__((noinline))
+#      else
+#        define FAST_CODE_NOINLINE
+#      endif
+#    endif
+#  endif
+#else
+#  include "platform.h"
+#endif
+
+#if defined(__has_include) && __has_include("build/build_config.h")
 #include "build/build_config.h"
+#endif
+#if defined(__has_include) && __has_include("build/debug.h")
 #include "build/debug.h"
+#endif
 
+#if defined(__has_include) && __has_include("common/axis.h")
 #include "common/axis.h"
+#endif
+#if defined(__has_include) && __has_include("common/filter.h")
 #include "common/filter.h"
+#endif
 
 #include "config/config.h"
 #include "config/config_reset.h"
@@ -879,6 +917,11 @@ STATIC_UNIT_TESTED void applyAbsoluteControl(const int axis, const float gyroRat
 }
 #endif
 
+// PID I-term relax: reduces integral accumulation during setpoint transients to avoid bounce-back and noise amplification.
+// Filters setpoint into low/high frequency components; derives relax factor from HPF magnitude.
+// Depending on `itermRelaxType`, scales or reconstructs `itermErrorRate`; angle mode uses tighter threshold.
+// Absolute Control hook (if enabled) can further correct setpoint/I near zero throttle to mitigate windup.
+// Debug (roll axis): logs `setpointHpf`, relax factor, and `itermErrorRate`.
 STATIC_UNIT_TESTED void applyItermRelax(const int axis, const float iterm,
     const float gyroRate, float *itermErrorRate, float *currentPidSetpoint)
 {
@@ -1110,6 +1153,16 @@ NOINLINE static void applySpa(int axis, const pidProfile_t *pidProfile)
 
 // Betaflight pid controller, which will be maintained in the future with additional features specialised for current (mini) multirotor usage.
 // Based on 2DOF reference design (matlab)
+// Overview (rate-mode axes):
+// - Computes staged rate setpoint per axis and error to gyro.
+// - Applies I-term Relax to limit integral when setpoint transient/jitter is detected.
+// - P: proportional to errorRate, with optional yaw lowpass and TPA.
+// - I: integrates `itermErrorRate` with anti-gravity accelerator; yaw uses separate windup limit.
+// - D: fixed-dT derivative on gyro with optional D-max gain scheduling and TPA.
+// - F: feedforward from rc.c (`getFeedforward`) for motor lag compensation; disabled in launch control.
+// - Integrates features: Absolute Control, Crash Recovery, Yaw Spin Recovery, Launch Control, Angle/Horizon.
+// Notes:
+// - Feedforward is pre-smoothed/attenuated in rc.c to remove RC frame jitter; PID D uses fixed loop time.
 void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTimeUs)
 {
     static float previousGyroRateDterm[XYZ_AXIS_COUNT];
@@ -1241,6 +1294,15 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
 #endif // USE_CHIRP
 
     // ----------PID controller----------
+    // Per-axis loop (ROLL, PITCH, YAW):
+    // 1) Build a rate setpoint, optionally converted by Angle/Horizon/Race mode.
+    // 2) Compute errorRate = setpoint - gyro, then apply crash recovery and I-term modifiers.
+    // 3) P: proportional on errorRate, with yaw lowpass and TPA attenuation.
+    // 4) I: integrate modified error (itermErrorRate) with anti-gravity accelerator, windup limiting.
+    // 5) D: derivative on gyro using fixed dT, cascaded filters, optional D-Max gain scheduling.
+    // 6) F: feedforward from setpoint delta; disabled during Launch Control.
+    // 7) S: wing-specific term; then apply Setpoint PID Attenuation (SPA) if enabled.
+    // 8) Sum terms; optionally integrate yaw (IYC) and apply global enabling/gating.
     for (flight_dynamics_index_t axis = FD_ROLL; axis <= FD_YAW; ++axis) {
 
 #ifdef USE_CHIRP
@@ -1340,12 +1402,17 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
         // --------low-level gyro-based PID based on 2DOF PID controller. ----------
 
         // -----calculate P component
+        // P uses `errorRate` and is attenuated by TPA (Throttle PID Attenuation).
+        // Yaw P additionally passes a simple PT1 lowpass (`ptermYawLowpass`) to tame noisy yaw response.
         pidData[axis].P = pidRuntime.pidCoefficient[axis].Kp * errorRate * getTpaFactor(pidProfile, axis, TERM_P);
         if (axis == FD_YAW) {
             pidData[axis].P = pidRuntime.ptermYawLowpassApplyFn((filter_t *) &pidRuntime.ptermYawLowpass, pidData[axis].P);
         }
 
         // -----calculate I component
+        // I integrates `itermErrorRate` with Ki and adds the anti-gravity accelerator.
+        // Anti-gravity boosts I accumulation on R/P only; yaw disables anti-gravity and uses a separate windup limit.
+        // Launch Control can override Ki and apply windup protection uniformly.
         float Ki = pidRuntime.pidCoefficient[axis].Ki;
         float itermLimit = pidRuntime.itermLimit; // windup fraction of pidSumLimit
 
@@ -1376,6 +1443,10 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
 
         // -----calculate D component
 
+        // -----feedforward source (setpoint delta)
+        // In acro/rate mode, feedforward comes from rc.c (`getFeedforward`) which is pre-smoothed, center-attenuated,
+        // and jitter-managed. In Angle mode the setpoint already embeds stick-based FF via `pidLevel`, so PID FF is
+        // forced to zero for now to avoid reintroducing RC steps.
         float pidSetpointDelta = 0;
 
 #if defined(USE_FEEDFORWARD) && defined(USE_ACC)
@@ -1398,6 +1469,10 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
 #endif
         pidRuntime.previousPidSetpoint[axis] = currentPidSetpoint; // this is the value sent to blackbox, and used for D-max setpoint
 
+        // -----calculate D component
+        // D is a fixed-time derivative of filtered gyro (`delta = -d(gyro)/dt`) to avoid variable-dt spikes.
+        // Filters: notch -> LPF1 -> LPF2 on the gyro rate, then TPA reduces D at high throttle.
+        // D-Max boosts Kd dynamically based on setpoint and gyro activity, then lowpasses the boost.
         // disable D if launch control is active
         if ((pidRuntime.pidCoefficient[axis].Kd > 0) && !launchControlActive) {
             // Divide rate change by dT to get differential (ie dr/dt).
@@ -1454,6 +1529,7 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
         previousGyroRateDterm[axis] = gyroRateDterm[axis];
 
         // -----calculate feedforward component
+        // F multiplies the setpoint delta by Kf. During Launch Control `Kf` is set to zero to keep attitude consistent.
 
 #ifdef USE_ABSOLUTE_CONTROL
         // include abs control correction in feedforward
@@ -1496,7 +1572,8 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
         }
 #endif
 
-        // Add P boost from antiGravity when sticks are close to zero
+        // Add P boost from Anti-Gravity when sticks are near center (low setpoint).
+        // Boost fades with stick deflection and only applies on R/P.
         if (axis != FD_YAW) {
             float agSetpointAttenuator = fabsf(currentPidSetpoint) / 50.0f;
             agSetpointAttenuator = MAX(agSetpointAttenuator, 1.0f);
@@ -1508,12 +1585,16 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
             }
         }
 
+        // S-term is a wing-specific stabilisation component; on multirotors this is typically zero.
         pidData[axis].S = getSterm(axis, pidProfile, currentPidSetpointBeforeWingAdjust);
+        // Apply Setpoint PID Attenuation (SPA): smoothly reduce P/D/I around configured setpoint windows.
         applySpa(axis, pidProfile);
 
         // calculating the PID sum
         const float pidSum = pidData[axis].P + pidData[axis].I + pidData[axis].D + pidData[axis].F + pidData[axis].S;
 #ifdef USE_INTEGRATED_YAW_CONTROL
+        // Integrated Yaw Control (IYC): integrate the yaw PID sum to emulate a rate-integrated controller.
+        // A small relaxation term leaks the integrator to avoid indefinite accumulation.
         if (axis == FD_YAW && pidRuntime.useIntegratedYaw) {
             pidData[axis].Sum += pidSum * pidRuntime.dT * 100.0f;
             pidData[axis].Sum -= pidData[axis].Sum * pidRuntime.integratedYawRelax / 100000.0f * pidRuntime.dT / 0.000125f;
@@ -1530,7 +1611,7 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
     bool isFixedWingAndPassthru = isFixedWing() && FLIGHT_MODE(PASSTHRU_MODE);
 #endif // USE_WING
     // Disable PID control if at zero throttle or if gyro overflow detected
-    // This may look very innefficient, but it is done on purpose to always show real CPU usage as in flight
+    // (Also for fixed-wing passthru.) Keeps CPU usage indicative of in-flight cost even when PIDs are gated.
     if (!pidRuntime.pidStabilisationEnabled
         || gyroOverflowDetected()
 #ifdef USE_WING

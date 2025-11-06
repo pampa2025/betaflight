@@ -380,6 +380,10 @@ static FAST_CODE_NOINLINE void rcSmoothingSetFilterCutoffs(rcSmoothingFilter_t *
 }
 
 #ifdef USE_FEEDFORWARD
+// Feedforward smoothing cutoffs track the smoothed Rx link rate so that
+// the perceived feedforward time constants remain stable across packet rates.
+// We derive a PT1 gain from an equivalent delay (pid->feedforwardSmoothFactor)
+// and update both setpoint speed and setpoint speed delta filters per axis.
 static FAST_CODE_NOINLINE void updateFeedforwardFilters(const pidRuntime_t *pid) {
     float pt1K = pt1FilterGainFromDelay(pid->feedforwardSmoothFactor, 1.0f / smoothedRxRateHz);
     for (int axis = FD_ROLL; axis <= FD_YAW; axis++) {
@@ -392,6 +396,9 @@ static FAST_CODE_NOINLINE void updateFeedforwardFilters(const pidRuntime_t *pid)
 }
 #endif
 
+// RC smoothing:
+// - Smooth setpoint and feedforward streams to eliminate stair-step inputs.
+// - In Horizon mode, smooth rcDeflection on roll/pitch to avoid sharp angle jumps.
 static FAST_CODE void processRcSmoothingFilter(void)
 {
     static FAST_DATA_ZERO_INIT float rxDataToSmooth[4];
@@ -426,6 +433,19 @@ static FAST_CODE void processRcSmoothingFilter(void)
 #endif // USE_RC_SMOOTHING_FILTER
 
 #ifdef USE_FEEDFORWARD
+/*
+ * Feedforward generation for rate mode.
+ *
+ * Pipeline:
+ *  1) Compute setpoint speed = Δsetpoint * Rx rate (per axis). Handle duplicate frames
+ *     by extrapolating the first duplicate and zeroing speed thereafter.
+ *  2) Smooth setpoint speed (PT1) and its delta (acceleration) to remove stair-steps.
+ *  3) Build feedforward as FF = setpointSpeed (+ boost from acceleration on roll/pitch).
+ *  4) Apply jitter attenuator: ((|Δrc| + prev|Δrc|)/2 + 1) * jitterFactorInv, clamped ≤ 1,
+ *     which preserves large stick moves and suppresses tiny frame jitter.
+ *  5) On yaw, add a short “hold” term to counteract motor lag during quick yaw moves.
+ *  6) Optionally transition FF near center sticks and apply averaging.
+ */
 static FAST_CODE_NOINLINE void calculateFeedforward(const pidRuntime_t *pid, flight_dynamics_index_t axis)
 {
     const float rxInterval = currentRxIntervalUs * 1e-6f; // seconds
@@ -558,6 +578,8 @@ static FAST_CODE_NOINLINE void calculateFeedforward(const pidRuntime_t *pid, fli
 }
 #endif // USE_FEEDFORWARD
 
+// Smooth the measured Rx link rate, reject transient outliers, and indicate
+// when filter cutoffs should update to the new smoothed rate.
 bool shouldUpdateSmoothing(void)
 {
     static int validCount = 0;
@@ -615,6 +637,8 @@ bool shouldUpdateSmoothing(void)
     return false;
 }
 
+// Convert RC inputs to per-axis rate setpoints, compute feedforward, and
+// optionally apply RC smoothing before the PID controller consumes them.
 FAST_CODE void processRcCommand(void)
 {
 	bool updateSmoothing = false;
