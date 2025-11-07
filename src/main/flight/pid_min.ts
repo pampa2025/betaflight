@@ -22,11 +22,17 @@ export {
 } from './pid_min_launch_control';
 import { clampf, pt1Alpha } from './utils';
 import {
-	PidMinDmaxConfig,
-	PidMinDmaxState,
-	computeDmaxMultiplier,
-	makeDefaultDmaxState,
+    PidMinDmaxConfig,
+    PidMinDmaxState,
+    computeDmaxMultiplier,
+    makeDefaultDmaxState,
 } from './pid_min_dmax';
+import {
+    PidMinFeedforwardRuntime,
+    PidMinFeedforwardState,
+    pidMinFeedforwardUpdate,
+    makePidMinFeedforwardState,
+} from './pid_min_feedforward';
 
 // Coefficients (gains)
 export interface PidMinCoefficients {
@@ -38,35 +44,42 @@ export interface PidMinCoefficients {
 
 // Runtime configuration
 export interface PidMinConfig {
-	pidSumLimit: number; // clamp output sum to [-limit, +limit]; 0 disables
-	itermLimit: number; // clamp integrator to [-limit, +limit]; 0 disables
-	integratorLeak: number; // 0..1 fraction leaked per update; 0 disables
-	useFeedforward: boolean; // include setpoint change feedforward
-	dLowpassCutoffHz: number; // PT1 cutoff for gyro used by D-term; 0 disables
-	// I-term relax (minimal)
-	iRelax: PidMinItermRelaxConfig; // nested configuration for I-term relax
-	// D-Max boost (optional)
-	dMax?: PidMinDmaxConfig | null;
+    pidSumLimit: number; // clamp output sum to [-limit, +limit]; 0 disables
+    itermLimit: number; // clamp integrator to [-limit, +limit]; 0 disables
+    integratorLeak: number; // 0..1 fraction leaked per update; 0 disables
+    useFeedforward: boolean; // include setpoint change feedforward
+    dLowpassCutoffHz: number; // PT1 cutoff for gyro used by D-term; 0 disables
+    // I-term relax (minimal)
+    iRelax: PidMinItermRelaxConfig; // nested configuration for I-term relax
+    // D-Max boost (optional)
+    dMax?: PidMinDmaxConfig | null;
+    // Advanced feedforward integration (optional)
+    // When enabled, F-term is sourced from rc.c-style feedforward rather than simple Kf * Δsetpoint
+    feedforwardMode?: 'simple' | 'advanced';
+    feedforwardRuntime?: PidMinFeedforwardRuntime | null;
 }
 
 // Per-axis state
 export class PidMinState {
-	integrator = 0; // I-term accumulator
-	prevGyroFiltered = 0; // last filtered gyro (for D-term stability)
-	prevSetpoint = 0; // last setpoint (for feedforward)
-	prevSetpointLpf = 0; // last lowpassed setpoint (for I-term relax)
-	initialized = false; // guard first update
-	dmax: PidMinDmaxState = makeDefaultDmaxState(); // D-Max per-axis state
+    integrator = 0; // I-term accumulator
+    prevGyroFiltered = 0; // last filtered gyro (for D-term stability)
+    prevSetpoint = 0; // last setpoint (for feedforward)
+    prevSetpointLpf = 0; // last lowpassed setpoint (for I-term relax)
+    initialized = false; // guard first update
+    dmax: PidMinDmaxState = makeDefaultDmaxState(); // D-Max per-axis state
+    // Advanced feedforward per-axis state (optional)
+    ff: PidMinFeedforwardState | null = null;
 }
 
 // Init/reset
 export function pidMinInit(s: PidMinState): void {
-	s.integrator = 0;
-	s.prevGyroFiltered = 0;
-	s.prevSetpoint = 0;
-	s.prevSetpointLpf = 0;
-	s.initialized = false;
-	s.dmax = makeDefaultDmaxState();
+    s.integrator = 0;
+    s.prevGyroFiltered = 0;
+    s.prevSetpoint = 0;
+    s.prevSetpointLpf = 0;
+    s.initialized = false;
+    s.dmax = makeDefaultDmaxState();
+    s.ff = null;
 }
 
 export function pidMinReset(s: PidMinState): void {
@@ -88,18 +101,19 @@ export function pidMinReset(s: PidMinState): void {
 // Pure unified update: returns next state without mutating the input.
 // This is ideal for simulators or functional pipelines.
 export function pidMinUpdateUnified(
-	c: PidMinCoefficients,
-	cfg: PidMinConfig,
-	lc: PidMinLaunchConfig | null | undefined,
-	prev: Readonly<PidMinState>,
-	axis: PidMinAxis,
-	setpoint: number,
-	gyro: number,
-	dt: number,
-	launchActive: boolean,
-	rcDeflection: number,
-	currentPitchAngleDeg: number,
-	trimPitchDeg: number
+    c: PidMinCoefficients,
+    cfg: PidMinConfig,
+    lc: PidMinLaunchConfig | null | undefined,
+    prev: Readonly<PidMinState>,
+    axis: PidMinAxis,
+    setpoint: number,
+    gyro: number,
+    dt: number,
+    launchActive: boolean,
+    rcDeflection: number,
+    currentPitchAngleDeg: number,
+    trimPitchDeg: number,
+    ffCtx?: { rcCmd: number; rxRateHz: number; rxIntervalUs: number; maxRcRate: number }
 ): { output: number; state: PidMinState } {
 	if (!c || !cfg || !prev) return { output: 0, state: new PidMinState() };
 	if (dt <= 0) return { output: 0, state: new PidMinState() };
@@ -199,12 +213,30 @@ export function pidMinUpdateUnified(
 		D = c.Kd * deltaGyroDt * dMultiplier;
 	}
 
-	// Feedforward disabled under launch
-	let F = 0;
-	if (cfg.useFeedforward && c.Kf !== 0 && !launchEffects.disableFeedforward) {
-		const dSetpoint = setpoint - setpointPrev;
-		F = c.Kf * dSetpoint;
-	}
+    // Feedforward: simple (Kf * Δsetpoint) or advanced rc-style, gated by launch
+    let F = 0;
+    let ffNext: PidMinFeedforwardState | null = prev.ff || null;
+    if (cfg.useFeedforward && !launchEffects.disableFeedforward) {
+        const mode = cfg.feedforwardMode ?? 'simple';
+        if (mode === 'advanced' && cfg.feedforwardRuntime && ffCtx) {
+            const prevFf = ffNext ?? makePidMinFeedforwardState(cfg.feedforwardRuntime);
+            const { value, state } = pidMinFeedforwardUpdate(
+                prevFf,
+                cfg.feedforwardRuntime,
+                axis,
+                setpoint,
+                ffCtx.rcCmd,
+                ffCtx.rxRateHz,
+                ffCtx.rxIntervalUs,
+                ffCtx.maxRcRate
+            );
+            F = value;
+            ffNext = state;
+        } else if (c.Kf !== 0) {
+            const dSetpoint = setpoint - setpointPrev;
+            F = c.Kf * dSetpoint;
+        }
+    }
 
 	// P/I disabled for non-pitch axes in pitch-only mode
 	if (launchEffects.disableP) {
@@ -219,15 +251,16 @@ export function pidMinUpdateUnified(
 		sum = clampf(sum, -cfg.pidSumLimit, cfg.pidSumLimit);
 	}
 
-	const next = new PidMinState();
-	next.integrator = integrator;
-	next.prevGyroFiltered = gyroFiltered;
-	next.prevSetpoint = setpoint;
-	next.prevSetpointLpf = setpointLpfNext;
-	next.initialized = true;
-	next.dmax = dmaxNext;
+    const next = new PidMinState();
+    next.integrator = integrator;
+    next.prevGyroFiltered = gyroFiltered;
+    next.prevSetpoint = setpoint;
+    next.prevSetpointLpf = setpointLpfNext;
+    next.initialized = true;
+    next.dmax = dmaxNext;
+    next.ff = ffNext;
 
-	return { output: sum, state: next };
+    return { output: sum, state: next };
 }
 
 // Usage examples (safe line comments)
