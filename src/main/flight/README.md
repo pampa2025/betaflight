@@ -60,36 +60,51 @@ To simplify integration, use `web_controller.ts` which hides the fixed-step accu
 import { useMemo } from 'react';
 import { useFrame } from '@react-three/fiber';
 import { makeWebFlightController } from './web_controller';
-import { normalizePidMinConfigForWeb, normalizePidMinLaunchConfig, PidMinLaunchMode } from './pid_min';
+import {
+	normalizePidMinConfigForWeb,
+	normalizePidMinLaunchConfig,
+	PidMinLaunchMode,
+} from './pid_min';
 
-const controller = useMemo(() => makeWebFlightController({
-  coeffs: { Kp: 0.9, Ki: 0.15, Kd: 0.02, Kf: 0.0 },
-  cfg: normalizePidMinConfigForWeb({ feedforwardMode: 'web' }, { controlRateHz: 300, inputRateHz: 60 }),
-  launch: normalizePidMinLaunchConfig({ mode: PidMinLaunchMode.Full, angleLimitDeg: 25 }),
-  controlRateHz: 300,
-}), []);
+const controller = useMemo(
+	() =>
+		makeWebFlightController({
+			coeffs: { Kp: 0.9, Ki: 0.15, Kd: 0.02, Kf: 0.0 },
+			cfg: normalizePidMinConfigForWeb(
+				{ feedforwardMode: 'web' },
+				{ controlRateHz: 300, inputRateHz: 60 }
+			),
+			launch: normalizePidMinLaunchConfig({
+				mode: PidMinLaunchMode.Full,
+				angleLimitDeg: 25,
+			}),
+			controlRateHz: 300,
+		}),
+	[]
+);
 
 useFrame((state) => {
-  const frameDt = state.clock.getDelta();
-  const joystick = readGamepadAxes(); // { roll, pitch, yaw } in [-1,1]
-  const gyro = getSimulatedGyroDegS(); // current angular rates from your physics
-  const sensors = { armed, altitude, verticalSpeed, throttle };
+	const frameDt = state.clock.getDelta();
+	const joystick = readGamepadAxes(); // { roll, pitch, yaw } in [-1,1]
+	const gyro = getSimulatedGyroDegS(); // current angular rates from your physics
+	const sensors = { armed, altitude, verticalSpeed, throttle };
 
-  const snap = controller.stepFrame({
-    frameDt,
-    gyro,
-    joystick,
-    sensors,            // omit to skip stage detector
-    rcDeflectionAxis: joystick,
-    pitchAngleDeg: 0,
-    trimPitchDeg: 0,
-  });
+	const snap = controller.stepFrame({
+		frameDt,
+		gyro,
+		joystick,
+		sensors, // omit to skip stage detector
+		rcDeflectionAxis: joystick,
+		pitchAngleDeg: 0,
+		trimPitchDeg: 0,
+	});
 
-  applyToPhysics(snap.outputs, controller.controlDt);
+	applyToPhysics(snap.outputs, controller.controlDt);
 });
 ```
 
 Notes:
+
 - `controller.controlDt` is the fixed control step (e.g., `1/300 s`).
 - When `sensors` are provided, the wrapper uses `pidMinUpdateWebAllWithStage(...)` and returns `snap.stage` and `snap.launchActive`.
 - Without `sensors`, the wrapper uses `pidMinUpdateWebAllWithAxisDeflection(...)` when `Full` mode, otherwise `pidMinUpdateWebAll(...)`.
@@ -107,21 +122,33 @@ Example:
 
 ```ts
 import { startWebControlLoop } from './web_control_loop';
-import { normalizePidMinConfigForWeb, normalizePidMinLaunchConfig, PidMinLaunchMode } from './pid_min';
+import {
+	normalizePidMinConfigForWeb,
+	normalizePidMinLaunchConfig,
+	PidMinLaunchMode,
+} from './pid_min';
 
 const handle = startWebControlLoop({
-  coeffs: { Kp: 0.9, Ki: 0.15, Kd: 0.02, Kf: 0.0 },
-  cfg: normalizePidMinConfigForWeb({ feedforwardMode: 'web' }, { controlRateHz: 60, inputRateHz: 60 }),
-  launch: normalizePidMinLaunchConfig({ mode: PidMinLaunchMode.Full, angleLimitDeg: 25 }),
-  controlRateHz: 300, // e.g. 300–500 Hz for higher fidelity
-  inputRateHz: 60,    // typical Gamepad rate; feedforward bridges to control
-  scheduler: 'raf',   // prefer RAF when available for smoother timing
-  maxStepsPerTick: 8, // optional safety limit when catching up
-  readJoystick: () => readGamepadAxes(),           // { roll, pitch, yaw }
-  readGyro: () => getSimGyroDegS(),                // { roll, pitch, yaw } deg/s
-  readSensors: () => ({ armed, altitude, verticalSpeed, throttle }),
-  onOutputs: (outputs, dt) => applyToPhysics(outputs, dt),
-  onStageUpdate: (stage, launchActive) => { /* telemetry, UI, logging */ },
+	coeffs: { Kp: 0.9, Ki: 0.15, Kd: 0.02, Kf: 0.0 },
+	cfg: normalizePidMinConfigForWeb(
+		{ feedforwardMode: 'web' },
+		{ controlRateHz: 60, inputRateHz: 60 }
+	),
+	launch: normalizePidMinLaunchConfig({
+		mode: PidMinLaunchMode.Full,
+		angleLimitDeg: 25,
+	}),
+	controlRateHz: 300, // e.g. 300–500 Hz for higher fidelity
+	inputRateHz: 60, // typical Gamepad rate; feedforward bridges to control
+	scheduler: 'raf', // prefer RAF when available for smoother timing
+	maxStepsPerTick: 8, // optional safety limit when catching up
+	readJoystick: () => readGamepadAxes(), // { roll, pitch, yaw }
+	readGyro: () => getSimGyroDegS(), // { roll, pitch, yaw } deg/s
+	readSensors: () => ({ armed, altitude, verticalSpeed, throttle }),
+	onOutputs: (outputs, dt) => applyToPhysics(outputs, dt),
+	onStageUpdate: (stage, launchActive) => {
+		/* telemetry, UI, logging */
+	},
 });
 
 // Later when stopping the sim:
@@ -129,6 +156,7 @@ const handle = startWebControlLoop({
 ```
 
 Notes:
+
 - The loop uses drift-compensated timing to keep the control step near `1/controlRateHz`.
 - When `scheduler: 'raf'` (default if available), the loop synchronizes with the browser’s frame clock but runs multiple fixed control steps per RAF tick as needed.
 - `inputRateHz` informs the web feedforward smoothing so 60 Hz stick input maps cleanly into higher-rate PID updates.
@@ -220,7 +248,12 @@ File: `pid_min_iterm_relax.ts`
 ## Example (Web Mode)
 
 ```ts
-import { PidMinCoefficients, PidMinConfig, PidMinState, pidMinUpdateWebAll } from './pid_min';
+import {
+	PidMinCoefficients,
+	PidMinConfig,
+	PidMinState,
+	pidMinUpdateWebAll,
+} from './pid_min';
 import { PidMinItermRelaxType } from './pid_min_iterm_relax';
 import { normalizePidMinWebFeedforwardRuntime } from './pid_min_feedforward_web';
 
@@ -229,70 +262,100 @@ const dt = 1 / loopHz;
 
 const c: PidMinCoefficients = { Kp: 0.9, Ki: 0.3, Kd: 0.02, Kf: 0 };
 const webRt = normalizePidMinWebFeedforwardRuntime({
-  inputRateHz: 60,
-  controlRateHz: loopHz,
-  deadband: 0.02,
-  expo: 0.2,
-  smoothingTauMs: 25,
-  derivativeGain: 1.0,
-  derivativeCutoffHz: 30,
-  maxRateDegS: { roll: 600, pitch: 600, yaw: 400 },
+	inputRateHz: 60,
+	controlRateHz: loopHz,
+	deadband: 0.02,
+	expo: 0.2,
+	smoothingTauMs: 25,
+	derivativeGain: 1.0,
+	derivativeCutoffHz: 30,
+	maxRateDegS: { roll: 600, pitch: 600, yaw: 400 },
 });
 
-const cfg: PidMinConfig = normalizePidMinConfigForWeb({ feedforwardMode: 'web' }, webRt);
+const cfg: PidMinConfig = normalizePidMinConfigForWeb(
+	{ feedforwardMode: 'web' },
+	webRt
+);
 
-let state = { roll: new PidMinState(), pitch: new PidMinState(), yaw: new PidMinState() };
+let state = {
+	roll: new PidMinState(),
+	pitch: new PidMinState(),
+	yaw: new PidMinState(),
+};
 
-function step(gyro: { roll: number; pitch: number; yaw: number }, joystick: { roll: number; pitch: number; yaw: number }) {
-  const { outputs, state: next } = pidMinUpdateWebAll(
-    c,
-    cfg,
-    /* lc */ null,
-    state,
-    gyro,
-    joystick,
-    dt,
-    /* launchActive */ false,
-    /* rcDeflection */ 0,
-    /* currentPitchAngleDeg */ 0,
-    /* trimPitchDeg */ 0,
-  );
-  state = next;
-  return outputs;
+function step(
+	gyro: { roll: number; pitch: number; yaw: number },
+	joystick: { roll: number; pitch: number; yaw: number }
+) {
+	const { outputs, state: next } = pidMinUpdateWebAll(
+		c,
+		cfg,
+		/* lc */ null,
+		state,
+		gyro,
+		joystick,
+		dt,
+		/* launchActive */ false,
+		/* rcDeflection */ 0,
+		/* currentPitchAngleDeg */ 0,
+		/* trimPitchDeg */ 0
+	);
+	state = next;
+	return outputs;
 }
 
 // Example (Web Mode + Launch Stage + Full-mode launch)
 // Assuming you collect altitude, verticalSpeed, throttle, and optional accelZ
-import { makeDefaultLaunchStageConfig, makeLaunchStageState } from './pid_min_launch_stage';
+import {
+	makeDefaultLaunchStageConfig,
+	makeLaunchStageState,
+} from './pid_min_launch_stage';
 
 const stageCfg = makeDefaultLaunchStageConfig();
-const lc = normalizePidMinLaunchConfig({ enabled: true, mode: PidMinLaunchMode.Full, angleLimitDeg: 30, kiOverride: 0.15 });
+const lc = normalizePidMinLaunchConfig({
+	enabled: true,
+	mode: PidMinLaunchMode.Full,
+	angleLimitDeg: 30,
+	kiOverride: 0.15,
+});
 let stageState = makeLaunchStageState();
 
 function stepWithStage(
-  gyro: { roll: number; pitch: number; yaw: number },
-  joystick: { roll: number; pitch: number; yaw: number },
-  sensors: { armed: boolean; altitude: number; verticalSpeed: number; throttle: number; motorsSpinning?: boolean; accelZ?: number }
+	gyro: { roll: number; pitch: number; yaw: number },
+	joystick: { roll: number; pitch: number; yaw: number },
+	sensors: {
+		armed: boolean;
+		altitude: number;
+		verticalSpeed: number;
+		throttle: number;
+		motorsSpinning?: boolean;
+		accelZ?: number;
+	}
 ) {
-  const { outputs, state: nextState, stage: nextStage, launchActive } = pidMinUpdateWebAllWithStage(
-    c,
-    cfg,
-    lc,
-    stageCfg,
-    stageState,
-    state,
-    gyro,
-    joystick,
-    dt,
-    sensors,
-    /* rcDeflectionAxis */ joystick,
-    /* currentPitchAngleDeg */ 0,
-    /* trimPitchDeg */ 0,
-  );
-  state = nextState;
-  stageState = nextStage;
-  // launchActive indicates current stage according to detector
-  return outputs;
+	const {
+		outputs,
+		state: nextState,
+		stage: nextStage,
+		launchActive,
+	} = pidMinUpdateWebAllWithStage(
+		c,
+		cfg,
+		lc,
+		stageCfg,
+		stageState,
+		state,
+		gyro,
+		joystick,
+		dt,
+		sensors,
+		/* rcDeflectionAxis */ joystick,
+		/* currentPitchAngleDeg */ 0,
+		/* trimPitchDeg */ 0
+	);
+	state = nextState;
+	stageState = nextStage;
+	// launchActive indicates current stage according to detector
+	return outputs;
 }
 ```
 

@@ -61,7 +61,7 @@ function pt2ApplyCascade(
 		const y = x;
 		return { y, state: { s1: y, s2: y } };
 	}
-    const alpha = pt1Alpha(cutoffHz * CUTOFF_CORRECTION_PT2, dt);
+	const alpha = pt1Alpha(cutoffHz * CUTOFF_CORRECTION_PT2, dt);
 	const s1 = prev.s1 + alpha * (x - prev.s1);
 	const s2 = prev.s2 + alpha * (s1 - prev.s2);
 	return { y: s2, state: { s1, s2 } };
