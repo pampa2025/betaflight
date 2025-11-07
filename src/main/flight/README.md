@@ -113,7 +113,10 @@ const handle = startWebControlLoop({
   coeffs: { Kp: 0.9, Ki: 0.15, Kd: 0.02, Kf: 0.0 },
   cfg: normalizePidMinConfigForWeb({ feedforwardMode: 'web' }, { controlRateHz: 60, inputRateHz: 60 }),
   launch: normalizePidMinLaunchConfig({ mode: PidMinLaunchMode.Full, angleLimitDeg: 25 }),
-  controlRateHz: 60, // stable, independent of render
+  controlRateHz: 300, // e.g. 300–500 Hz for higher fidelity
+  inputRateHz: 60,    // typical Gamepad rate; feedforward bridges to control
+  scheduler: 'raf',   // prefer RAF when available for smoother timing
+  maxStepsPerTick: 8, // optional safety limit when catching up
   readJoystick: () => readGamepadAxes(),           // { roll, pitch, yaw }
   readGyro: () => getSimGyroDegS(),                // { roll, pitch, yaw } deg/s
   readSensors: () => ({ armed, altitude, verticalSpeed, throttle }),
@@ -127,6 +130,9 @@ const handle = startWebControlLoop({
 
 Notes:
 - The loop uses drift-compensated timing to keep the control step near `1/controlRateHz`.
+- When `scheduler: 'raf'` (default if available), the loop synchronizes with the browser’s frame clock but runs multiple fixed control steps per RAF tick as needed.
+- `inputRateHz` informs the web feedforward smoothing so 60 Hz stick input maps cleanly into higher-rate PID updates.
+- `maxStepsPerTick` can prevent unbounded catch-up if the tab stalls; tune based on your physics budget.
 - Joystick sampling at 60 Hz is bridged by the web feedforward smoothing; running the PID at 60 Hz is fine if you prefer simplicity.
 - Rendering can subscribe to physics state independently; no framework integration is required.
 

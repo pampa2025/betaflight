@@ -65,10 +65,13 @@ export function makeWebFlightController(args: {
   initialState?: Axis3<PidMinState>;
 }): WebFlightController {
   const coeffs = args.coeffs;
-  const cfg = (isFullCfg(args.cfg) ? args.cfg as PidMinConfig : normalizePidMinConfigForWeb(args.cfg as Partial<PidMinConfig>));
+  const controlRateHz = args.controlRateHz ?? 300;
+  const cfg = (isFullCfg(args.cfg)
+    ? (args.cfg as PidMinConfig)
+    : normalizePidMinConfigForWeb(args.cfg as Partial<PidMinConfig>, { controlRateHz, inputRateHz: 60 })
+  );
   const lc = args.launch == null ? null : normalizePidMinLaunchConfig(args.launch as Partial<PidMinLaunchConfig>);
   const stageCfg = args.stage ?? makeDefaultLaunchStageConfig();
-  const controlRateHz = args.controlRateHz ?? 300;
   const controlDt = 1 / controlRateHz;
 
   // Persistent state

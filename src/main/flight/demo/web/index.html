@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Betaflight Web Control Loop Demo</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Betaflight Web Control Loop (Standalone)</h1>
+      <p>Move your gamepad sticks to drive roll/pitch/yaw. PID runs at high frequency using RAF.</p>
+    </header>
+
+    <section id="controls">
+      <button id="startBtn">Start Loop</button>
+      <button id="stopBtn" disabled>Stop Loop</button>
+      <label>
+        Control Rate (Hz)
+        <input id="rateInput" type="number" min="60" max="1000" step="30" value="300" />
+      </label>
+    </section>
+
+    <section id="telemetry">
+      <div class="row"><span class="label">Outputs</span><span id="outRoll">roll: 0</span><span id="outPitch">pitch: 0</span><span id="outYaw">yaw: 0</span></div>
+      <div class="row"><span class="label">Gyro</span><span id="gyroRoll">roll: 0</span><span id="gyroPitch">pitch: 0</span><span id="gyroYaw">yaw: 0</span></div>
+      <div class="row"><span class="label">Joystick</span><span id="joyRoll">roll: 0</span><span id="joyPitch">pitch: 0</span><span id="joyYaw">yaw: 0</span></div>
+      <div class="row"><span class="label">Pitch Angle</span><span id="pitchAngle">0 deg</span></div>
+      <div class="hint">Tip: Press any controller button once so the browser recognizes your gamepad.</div>
+    </section>
+
+    <section id="plotSection">
+      <h2>Plots: Target vs. gyro</h2>
+      <div class="plotGrid">
+        <div class="plotRow">
+          <h3>Roll</h3>
+          <canvas id="plotRoll" width="640" height="200" class="plot"></canvas>
+        </div>
+        <div class="plotRow">
+          <h3>Pitch</h3>
+          <canvas id="plotPitch" width="640" height="200" class="plot"></canvas>
+        </div>
+        <div class="plotRow">
+          <h3>Yaw</h3>
+          <canvas id="plotYaw" width="640" height="200" class="plot"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <script type="module" src="bundle.js"></script>
+  </body>
+  </html>
