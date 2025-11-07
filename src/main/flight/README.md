@@ -97,6 +97,39 @@ Notes:
 
 ### Suggested Defaults
 
+## Framework-agnostic Control Loop
+
+File: `web_control_loop.ts`
+
+Runs the PID at a fixed rate (default 60 Hz) fully decoupled from rendering. You provide small callbacks to read joystick/gyro and consume PID outputs. Optional launch-stage updates are delivered via a telemetry callback.
+
+Example:
+
+```ts
+import { startWebControlLoop } from './web_control_loop';
+import { normalizePidMinConfigForWeb, normalizePidMinLaunchConfig, PidMinLaunchMode } from './pid_min';
+
+const handle = startWebControlLoop({
+  coeffs: { Kp: 0.9, Ki: 0.15, Kd: 0.02, Kf: 0.0 },
+  cfg: normalizePidMinConfigForWeb({ feedforwardMode: 'web' }, { controlRateHz: 60, inputRateHz: 60 }),
+  launch: normalizePidMinLaunchConfig({ mode: PidMinLaunchMode.Full, angleLimitDeg: 25 }),
+  controlRateHz: 60, // stable, independent of render
+  readJoystick: () => readGamepadAxes(),           // { roll, pitch, yaw }
+  readGyro: () => getSimGyroDegS(),                // { roll, pitch, yaw } deg/s
+  readSensors: () => ({ armed, altitude, verticalSpeed, throttle }),
+  onOutputs: (outputs, dt) => applyToPhysics(outputs, dt),
+  onStageUpdate: (stage, launchActive) => { /* telemetry, UI, logging */ },
+});
+
+// Later when stopping the sim:
+// handle.stop();
+```
+
+Notes:
+- The loop uses drift-compensated timing to keep the control step near `1/controlRateHz`.
+- Joystick sampling at 60 Hz is bridged by the web feedforward smoothing; running the PID at 60 Hz is fine if you prefer simplicity.
+- Rendering can subscribe to physics state independently; no framework integration is required.
+
 - `smoothingTauMs`: 20–40 ms
 - `derivativeCutoffHz`: 20–40 Hz
 - `derivativeGain`: ~1.0
