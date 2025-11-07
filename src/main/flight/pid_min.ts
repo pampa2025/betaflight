@@ -1,6 +1,17 @@
 // Minimal Betaflight-style PID controller (TypeScript)
 // Mirrors src/main/flight/pid_min.c with a tiny, dependency-free core
 // and a minimal Launch Control feature for one axis.
+//
+// Web simulator notes:
+// - For Gamepad inputs (~60 Hz), set cfg.feedforwardMode = 'web' and provide
+//   cfg.webFeedforwardRuntime. See pid_min_feedforward_web.ts for details.
+// - Use pidMinUpdateWebAll(...) for single rcDeflection launches (PitchOnly).
+// - Use pidMinUpdateWebAllWithAxisDeflection(...) for FULL-mode launches where
+//   per-axis stick deflections should affect launch setpoints.
+// - To auto-drive launchActive from altitude/velocity with table-start support,
+//   use pidMinUpdateWebAllWithStage(...).
+// - Additional conversion notes for D-Max, Launch Control, and I-term relax are
+//   documented in src/main/flight/README.md.
 import {
 	PidMinItermRelaxType,
 	computeItermRelax,
@@ -38,7 +49,13 @@ import {
     PidMinWebFeedforwardState,
     pidMinWebFeedforwardUpdate,
     makePidMinWebFeedforwardState,
+    normalizePidMinWebFeedforwardRuntime,
 } from './pid_min_feedforward_web';
+import {
+    PidMinLaunchStageConfig,
+    PidMinLaunchStageState,
+    updateLaunchStage,
+} from './pid_min_launch_stage';
 
 // Simple 3-axis container
 export type Axis3<T> = { roll: T; pitch: T; yaw: T };
@@ -301,6 +318,59 @@ export function pidMinUpdateUnified(
     return { output: sum, state: next };
 }
 
+// ---- Configuration helpers (dt-first, parameterized) ------------------------
+// Normalize a partial config for web simulator usage with sensible defaults.
+// Provide either `controlRateHz` or use your own dt when updating.
+export function normalizePidMinConfigForWeb(
+    inCfg: Partial<PidMinConfig>,
+    inWebRt?: Partial<PidMinWebFeedforwardRuntime>
+): PidMinConfig {
+    const feedforwardMode = inCfg.feedforwardMode ?? 'web';
+    const webRt = inCfg.webFeedforwardRuntime ?? (inWebRt ? normalizePidMinWebFeedforwardRuntime(inWebRt) : normalizePidMinWebFeedforwardRuntime({}));
+    const dMax: PidMinDmaxConfig | null = inCfg.dMax ?? {
+        enabled: true,
+        dMaxPercent: { roll: 1.25, pitch: 1.25, yaw: 1.10 },
+        gain: 37,
+        advance: 20,
+        rangeCutoffHz: 85,
+        lowpassCutoffHz: 35,
+    };
+    const iRelax: PidMinItermRelaxConfig = inCfg.iRelax ?? {
+        iRelaxEnabled: true,
+        iRelaxCutoffHz: 15,
+        iRelaxSetpointThreshold: 40,
+        iRelaxType: PidMinItermRelaxType.Setpoint,
+    };
+    return {
+        pidSumLimit: inCfg.pidSumLimit ?? 0,
+        itermLimit: inCfg.itermLimit ?? 100,
+        integratorLeak: inCfg.integratorLeak ?? 0.05,
+        useFeedforward: inCfg.useFeedforward ?? true,
+        dLowpassCutoffHz: inCfg.dLowpassCutoffHz ?? 40,
+        iRelax,
+        dMax,
+        feedforwardMode,
+        feedforwardRuntime: inCfg.feedforwardRuntime ?? null,
+        webFeedforwardRuntime: webRt,
+    };
+}
+
+// Normalize Launch Control config with runtime overrides for rates/windows.
+export function normalizePidMinLaunchConfig(
+    inLc: Partial<PidMinLaunchConfig>
+): PidMinLaunchConfig {
+    return {
+        enabled: inLc.enabled ?? true,
+        mode: inLc.mode ?? PidMinLaunchMode.PitchOnly,
+        angleLimitDeg: inLc.angleLimitDeg ?? 30,
+        kiOverride: inLc.kiOverride ?? 0.15,
+        maxRateDegS: inLc.maxRateDegS ?? 100,
+        minRateDegS: inLc.minRateDegS ?? 5,
+        angleWindowDeg: inLc.angleWindowDeg ?? 10,
+        yawItermLimitDegS: inLc.yawItermLimitDegS ?? 50,
+    };
+}
+
 // Convenience: 3-axis update for Web joystick input.
 // Requires cfg.feedforwardMode === 'web' and cfg.webFeedforwardRuntime initialized.
 export function pidMinUpdateWebAll(
@@ -369,6 +439,127 @@ export function pidMinUpdateWebAll(
         outputs: { roll: r.output, pitch: p.output, yaw: y.output },
         state: { roll: r.state, pitch: p.state, yaw: y.state },
     };
+}
+
+// Convenience: 3-axis update for Web joystick input with per-axis rcDeflection.
+// Use this when Launch Control mode is FULL and you want independent stick
+// deflections per axis to affect launch setpoints.
+// Requires cfg.feedforwardMode === 'web' and cfg.webFeedforwardRuntime initialized.
+export function pidMinUpdateWebAllWithAxisDeflection(
+    c: PidMinCoefficients,
+    cfg: PidMinConfig,
+    lc: PidMinLaunchConfig | null | undefined,
+    prev: Axis3<Readonly<PidMinState>>,
+    gyro: Axis3<number>,
+    joystick: Axis3<number>,
+    dt: number,
+    launchActive: boolean,
+    rcDeflectionAxis: Axis3<number>,
+    currentPitchAngleDeg: number,
+    trimPitchDeg: number
+): { outputs: Axis3<number>; state: Axis3<PidMinState> } {
+    const r = pidMinUpdateUnified(
+        c,
+        cfg,
+        lc,
+        prev.roll,
+        PidMinAxis.Roll,
+        0,
+        gyro.roll,
+        dt,
+        launchActive,
+        rcDeflectionAxis.roll,
+        currentPitchAngleDeg,
+        trimPitchDeg,
+        undefined,
+        { joystick: joystick.roll }
+    );
+    const p = pidMinUpdateUnified(
+        c,
+        cfg,
+        lc,
+        prev.pitch,
+        PidMinAxis.Pitch,
+        0,
+        gyro.pitch,
+        dt,
+        launchActive,
+        rcDeflectionAxis.pitch,
+        currentPitchAngleDeg,
+        trimPitchDeg,
+        undefined,
+        { joystick: joystick.pitch }
+    );
+    const y = pidMinUpdateUnified(
+        c,
+        cfg,
+        lc,
+        prev.yaw,
+        PidMinAxis.Yaw,
+        0,
+        gyro.yaw,
+        dt,
+        launchActive,
+        rcDeflectionAxis.yaw,
+        currentPitchAngleDeg,
+        trimPitchDeg,
+        undefined,
+        { joystick: joystick.yaw }
+    );
+
+    return {
+        outputs: { roll: r.output, pitch: p.output, yaw: y.output },
+        state: { roll: r.state, pitch: p.state, yaw: y.state },
+    };
+}
+
+// Convenience: 3-axis web update wired to the Launch Stage detector.
+// - Computes `launchActive` using altitude/velocity debounced logic (supports table starts).
+// - Calls the per-axis rcDeflection wrapper so FULL-mode launch can reflect independent sticks.
+// Returns PID outputs/state and next Launch Stage state.
+export function pidMinUpdateWebAllWithStage(
+    c: PidMinCoefficients,
+    cfg: PidMinConfig,
+    lc: PidMinLaunchConfig | null | undefined,
+    stageCfg: Readonly<PidMinLaunchStageConfig>,
+    stagePrev: Readonly<PidMinLaunchStageState>,
+    prev: Axis3<Readonly<PidMinState>>,
+    gyro: Axis3<number>,
+    joystick: Axis3<number>,
+    dt: number,
+    stageInputs: { armed: boolean; altitude: number; verticalSpeed: number; throttle: number; motorsSpinning?: boolean; accelZ?: number },
+    rcDeflectionAxis: Axis3<number>,
+    currentPitchAngleDeg: number,
+    trimPitchDeg: number
+): { outputs: Axis3<number>; state: Axis3<PidMinState>; stage: PidMinLaunchStageState; launchActive: boolean } {
+    const stageRes = updateLaunchStage(stageCfg, stagePrev, {
+        armed: stageInputs.armed,
+        lcEnabled: !!(lc && lc.enabled),
+        altitude: stageInputs.altitude,
+        verticalSpeed: stageInputs.verticalSpeed,
+        throttle: stageInputs.throttle,
+        rcDeflection: rcDeflectionAxis.pitch, // typical: pitch deflection drives stage
+        motorsSpinning: stageInputs.motorsSpinning,
+        accelZ: stageInputs.accelZ,
+        timeStepMs: dt * 1000,
+    });
+    const launchActive = stageRes.launchActive;
+
+    const pidRes = pidMinUpdateWebAllWithAxisDeflection(
+        c,
+        cfg,
+        lc,
+        prev,
+        gyro,
+        joystick,
+        dt,
+        launchActive,
+        rcDeflectionAxis,
+        currentPitchAngleDeg,
+        trimPitchDeg
+    );
+
+    return { outputs: pidRes.outputs, state: pidRes.state, stage: stageRes.state, launchActive };
 }
 
 // Usage examples (safe line comments)

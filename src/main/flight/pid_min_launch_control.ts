@@ -19,6 +19,11 @@ export interface PidMinLaunchConfig {
     mode: PidMinLaunchMode; // pitch-only or full
     angleLimitDeg: number; // pitch angle limit in degrees (<=0 disables)
     kiOverride: number; // Ki override while active (0 uses normal Ki)
+    // Optional runtime overrides (with sane defaults)
+    maxRateDegS?: number; // default LAUNCH_CONTROL_MAX_RATE
+    minRateDegS?: number; // default LAUNCH_CONTROL_MIN_RATE
+    angleWindowDeg?: number; // default LAUNCH_CONTROL_ANGLE_WINDOW
+    yawItermLimitDegS?: number; // default LAUNCH_CONTROL_YAW_ITERM_LIMIT (Full mode)
 }
 
 // Constants (kept minimal and encapsulated here)
@@ -42,20 +47,23 @@ export function pidMinApplyLaunchSetpoint(
         return 0;
     }
     const stick = clampf(rcDeflection, -0.5, 0.5);
-    let rate = LAUNCH_CONTROL_MAX_RATE * (stick * 2.0); // map +/-0.5 to +/-max
+    const maxRate = lc.maxRateDegS ?? LAUNCH_CONTROL_MAX_RATE;
+    const minRate = lc.minRateDegS ?? LAUNCH_CONTROL_MIN_RATE;
+    const angleWindow = lc.angleWindowDeg ?? LAUNCH_CONTROL_ANGLE_WINDOW;
+    let rate = maxRate * (stick * 2.0); // map +/-0.5 to +/-max
     if (axis === PidMinAxis.Pitch && lc.angleLimitDeg > 0) {
         const currentAngle = currentPitchAngleDeg - trimPitchDeg;
         if (currentAngle >= lc.angleLimitDeg) {
             rate = 0;
         } else {
             const angleDelta = lc.angleLimitDeg - currentAngle;
-            if (angleDelta <= LAUNCH_CONTROL_ANGLE_WINDOW) {
+            if (angleDelta <= angleWindow) {
                 const targetRate = rate;
                 rate = scaleRangef(
                     angleDelta,
                     0,
-                    LAUNCH_CONTROL_ANGLE_WINDOW,
-                    rate >= 0 ? LAUNCH_CONTROL_MIN_RATE : -LAUNCH_CONTROL_MIN_RATE,
+                    angleWindow,
+                    rate >= 0 ? minRate : -minRate,
                     targetRate
                 );
             }
@@ -131,7 +139,7 @@ export function computeLaunchEffects(
         }
     } else if (lc.mode === PidMinLaunchMode.Full) {
         if (axis === PidMinAxis.Yaw) {
-            yawItermLimit = LAUNCH_CONTROL_YAW_ITERM_LIMIT;
+            yawItermLimit = lc.yawItermLimitDegS ?? LAUNCH_CONTROL_YAW_ITERM_LIMIT;
         }
     }
 
