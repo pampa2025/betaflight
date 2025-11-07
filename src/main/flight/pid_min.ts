@@ -33,6 +33,15 @@ import {
     pidMinFeedforwardUpdate,
     makePidMinFeedforwardState,
 } from './pid_min_feedforward';
+import {
+    PidMinWebFeedforwardRuntime,
+    PidMinWebFeedforwardState,
+    pidMinWebFeedforwardUpdate,
+    makePidMinWebFeedforwardState,
+} from './pid_min_feedforward_web';
+
+// Simple 3-axis container
+export type Axis3<T> = { roll: T; pitch: T; yaw: T };
 
 // Coefficients (gains)
 export interface PidMinCoefficients {
@@ -55,8 +64,10 @@ export interface PidMinConfig {
     dMax?: PidMinDmaxConfig | null;
     // Advanced feedforward integration (optional)
     // When enabled, F-term is sourced from rc.c-style feedforward rather than simple Kf * Δsetpoint
-    feedforwardMode?: 'simple' | 'advanced';
+    feedforwardMode?: 'simple' | 'advanced' | 'web';
     feedforwardRuntime?: PidMinFeedforwardRuntime | null;
+    // Web joystick feedforward (60 Hz), maps [-1,1] to deg/s and derivative FF
+    webFeedforwardRuntime?: PidMinWebFeedforwardRuntime | null;
 }
 
 // Per-axis state
@@ -69,6 +80,8 @@ export class PidMinState {
     dmax: PidMinDmaxState = makeDefaultDmaxState(); // D-Max per-axis state
     // Advanced feedforward per-axis state (optional)
     ff: PidMinFeedforwardState | null = null;
+    // Web feedforward per-axis state (optional)
+    webFf: PidMinWebFeedforwardState | null = null;
 }
 
 // Init/reset
@@ -80,6 +93,7 @@ export function pidMinInit(s: PidMinState): void {
     s.initialized = false;
     s.dmax = makeDefaultDmaxState();
     s.ff = null;
+    s.webFf = null;
 }
 
 export function pidMinReset(s: PidMinState): void {
@@ -113,7 +127,8 @@ export function pidMinUpdateUnified(
     rcDeflection: number,
     currentPitchAngleDeg: number,
     trimPitchDeg: number,
-    ffCtx?: { rcCmd: number; rxRateHz: number; rxIntervalUs: number; maxRcRate: number }
+    ffCtx?: { rcCmd: number; rxRateHz: number; rxIntervalUs: number; maxRcRate: number },
+    webCtx?: { joystick: number }
 ): { output: number; state: PidMinState } {
 	if (!c || !cfg || !prev) return { output: 0, state: new PidMinState() };
 	if (dt <= 0) return { output: 0, state: new PidMinState() };
@@ -128,17 +143,36 @@ export function pidMinUpdateUnified(
 		? prev.dmax
 		: makeDefaultDmaxState();
 
-	const launchEffects: PidMinLaunchEffects = computeLaunchEffects(
-		axis,
-		lc,
-		launchActive,
-		setpoint,
-		rcDeflection,
-		currentPitchAngleDeg,
-		trimPitchDeg,
-		c.Ki
-	);
-	setpoint = launchEffects.setpoint;
+    // Optional: map web joystick [-1,1] to target deg/s and compute web feedforward
+    let webF = 0;
+    let webFfNext: PidMinWebFeedforwardState | null = prev.webFf || null;
+    const modePre = cfg.feedforwardMode ?? 'simple';
+    if (modePre === 'web' && cfg.webFeedforwardRuntime && webCtx) {
+        const axisName = axis === PidMinAxis.Roll ? 'roll' : axis === PidMinAxis.Pitch ? 'pitch' : 'yaw';
+        const prevWeb = webFfNext ?? makePidMinWebFeedforwardState();
+        const { value, state, targetRateDegS } = pidMinWebFeedforwardUpdate(
+            prevWeb,
+            cfg.webFeedforwardRuntime,
+            axisName,
+            webCtx.joystick,
+            dt
+        );
+        setpoint = targetRateDegS;
+        webF = value;
+        webFfNext = state;
+    }
+
+    const launchEffects: PidMinLaunchEffects = computeLaunchEffects(
+        axis,
+        lc,
+        launchActive,
+        setpoint,
+        rcDeflection,
+        currentPitchAngleDeg,
+        trimPitchDeg,
+        c.Ki
+    );
+    setpoint = launchEffects.setpoint;
 
 	const errorRate = setpoint - gyro;
 
@@ -213,12 +247,15 @@ export function pidMinUpdateUnified(
 		D = c.Kd * deltaGyroDt * dMultiplier;
 	}
 
-    // Feedforward: simple (Kf * Δsetpoint) or advanced rc-style, gated by launch
+    // Feedforward: simple (Kf * Δsetpoint), advanced rc-style, or web joystick
     let F = 0;
     let ffNext: PidMinFeedforwardState | null = prev.ff || null;
+    let webFfStored: PidMinWebFeedforwardState | null = webFfNext;
     if (cfg.useFeedforward && !launchEffects.disableFeedforward) {
         const mode = cfg.feedforwardMode ?? 'simple';
-        if (mode === 'advanced' && cfg.feedforwardRuntime && ffCtx) {
+        if (mode === 'web' && cfg.webFeedforwardRuntime && webCtx) {
+            F = webF;
+        } else if (mode === 'advanced' && cfg.feedforwardRuntime && ffCtx) {
             const prevFf = ffNext ?? makePidMinFeedforwardState(cfg.feedforwardRuntime);
             const { value, state } = pidMinFeedforwardUpdate(
                 prevFf,
@@ -259,8 +296,79 @@ export function pidMinUpdateUnified(
     next.initialized = true;
     next.dmax = dmaxNext;
     next.ff = ffNext;
+    next.webFf = webFfStored;
 
     return { output: sum, state: next };
+}
+
+// Convenience: 3-axis update for Web joystick input.
+// Requires cfg.feedforwardMode === 'web' and cfg.webFeedforwardRuntime initialized.
+export function pidMinUpdateWebAll(
+    c: PidMinCoefficients,
+    cfg: PidMinConfig,
+    lc: PidMinLaunchConfig | null | undefined,
+    prev: Axis3<Readonly<PidMinState>>,
+    gyro: Axis3<number>,
+    joystick: Axis3<number>,
+    dt: number,
+    launchActive: boolean,
+    rcDeflection: number,
+    currentPitchAngleDeg: number,
+    trimPitchDeg: number
+): { outputs: Axis3<number>; state: Axis3<PidMinState> } {
+    const r = pidMinUpdateUnified(
+        c,
+        cfg,
+        lc,
+        prev.roll,
+        PidMinAxis.Roll,
+        0,
+        gyro.roll,
+        dt,
+        launchActive,
+        rcDeflection,
+        currentPitchAngleDeg,
+        trimPitchDeg,
+        undefined,
+        { joystick: joystick.roll }
+    );
+    const p = pidMinUpdateUnified(
+        c,
+        cfg,
+        lc,
+        prev.pitch,
+        PidMinAxis.Pitch,
+        0,
+        gyro.pitch,
+        dt,
+        launchActive,
+        rcDeflection,
+        currentPitchAngleDeg,
+        trimPitchDeg,
+        undefined,
+        { joystick: joystick.pitch }
+    );
+    const y = pidMinUpdateUnified(
+        c,
+        cfg,
+        lc,
+        prev.yaw,
+        PidMinAxis.Yaw,
+        0,
+        gyro.yaw,
+        dt,
+        launchActive,
+        rcDeflection,
+        currentPitchAngleDeg,
+        trimPitchDeg,
+        undefined,
+        { joystick: joystick.yaw }
+    );
+
+    return {
+        outputs: { roll: r.output, pitch: p.output, yaw: y.output },
+        state: { roll: r.state, pitch: p.state, yaw: y.state },
+    };
 }
 
 // Usage examples (safe line comments)
